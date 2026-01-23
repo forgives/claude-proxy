@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -36,6 +37,7 @@ type modelConfig struct {
 type fileConfig struct {
 	AK                        string           `json:"ak"`
 	Port                      int              `json:"port"`
+	Host                      string           `json:"host,omitempty"`
 	UpstreamTimeoutSeconds    int              `json:"upstream_timeout_seconds"`
 	LogBodyMaxChars           int              `json:"log_body_max_chars"`
 	LogStreamTextPreviewChars int              `json:"log_stream_text_preview_chars"`
@@ -44,6 +46,10 @@ type fileConfig struct {
 	// --- Tavily web tools ---
 	TavilyKey string `json:"tavily_key,omitempty"`
 	TavilyURL string `json:"tavily_url,omitempty"`
+
+	// --- Fetch LLM processing ---
+	FetchLLMModelID string `json:"fetch_llm_model_id,omitempty"`
+	FetchLLMPrompt  string `json:"fetch_llm_prompt,omitempty"`
 }
 
 type serverConfig struct {
@@ -63,6 +69,10 @@ type serverConfig struct {
 	tavilySearchDepth   string
 	tavilyTopic         string
 	tavilyFetchMaxRunes int
+
+	// --- Fetch LLM processing ---
+	fetchLLMModelID string
+	fetchLLMPrompt  string
 }
 
 type modelMapping struct {
@@ -120,7 +130,7 @@ func main() {
 }
 
 func loadConfig() (*serverConfig, error) {
-	fc, err := loadFileConfig(strings.TrimSpace(envOr("CONFIG_PATH", "config.json")))
+	fc, err := loadFileConfig(findConfigPath())
 	if err != nil {
 		return nil, err
 	}
@@ -129,7 +139,8 @@ func loadConfig() (*serverConfig, error) {
 	if fc.Port > 0 {
 		port = fc.Port
 	}
-	addr := fmt.Sprintf(":%d", port)
+	host := strings.TrimSpace(envOr("HOST", fc.Host))
+	addr := fmt.Sprintf("%s:%d", host, port)
 
 	serverAPIKey := strings.TrimSpace(fc.AK)
 
@@ -207,6 +218,12 @@ func loadConfig() (*serverConfig, error) {
 		}
 	}
 
+	fetchLLMModelID := strings.TrimSpace(envOr("FETCH_LLM_MODEL_ID", fc.FetchLLMModelID))
+	fetchLLMPrompt := strings.TrimSpace(envOr("FETCH_LLM_PROMPT", fc.FetchLLMPrompt))
+	if fetchLLMPrompt == "" && fetchLLMModelID != "" {
+		fetchLLMPrompt = "Please summarize and clean the following web page content, removing junk, navigation, and ads, but keeping all important information and context. Return only the cleaned content."
+	}
+
 	return &serverConfig{
 		addr:                addr,
 		serverAPIKey:        serverAPIKey,
@@ -223,6 +240,9 @@ func loadConfig() (*serverConfig, error) {
 		tavilySearchDepth:   tavilySearchDepth,
 		tavilyTopic:         tavilyTopic,
 		tavilyFetchMaxRunes: tavilyFetchMaxRunes,
+
+		fetchLLMModelID: fetchLLMModelID,
+		fetchLLMPrompt:  fetchLLMPrompt,
 	}, nil
 }
 
@@ -243,6 +263,32 @@ func envOr(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+func findConfigPath() string {
+	// 1. Env var
+	if p := strings.TrimSpace(os.Getenv("CONFIG_PATH")); p != "" {
+		return p
+	}
+
+	// 2. Exe dir
+	if exe, err := os.Executable(); err == nil {
+		p := filepath.Join(filepath.Dir(exe), "config.json")
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+
+	// 3. User config dir (normalized directory)
+	if confDir, err := os.UserConfigDir(); err == nil {
+		p := filepath.Join(confDir, "claude-proxy", "config.json")
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+
+	// 4. Fallback to current dir
+	return "config.json"
 }
 
 func handleModels(w http.ResponseWriter, r *http.Request, cfg *serverConfig) {
@@ -919,11 +965,11 @@ func runWebToolsLoop(ctx context.Context, cfg *serverConfig, reqID string, opena
 							"type":        "web_search_tool_result",
 							"tool_use_id": toolID,
 							"content": map[string]any{
-								"type":           "web_search_tool_result_error",
-								"error_code":     "max_uses_exceeded",
-								"error_message":  "web_search max_uses exceeded",
-								"retryable":      false,
-								"details":        "",
+								"type":          "web_search_tool_result_error",
+								"error_code":    "max_uses_exceeded",
+								"error_message": "web_search max_uses exceeded",
+								"retryable":     false,
+								"details":       "",
 							},
 						},
 					)
@@ -1103,7 +1149,7 @@ func runWebToolsLoopAndStream(w http.ResponseWriter, r *http.Request, cfg *serve
 			"content":       []any{},
 			"stop_reason":   nil,
 			"stop_sequence": nil,
-			"usage": map[string]any{"input_tokens": 0, "output_tokens": 0},
+			"usage":         map[string]any{"input_tokens": 0, "output_tokens": 0},
 		},
 	})
 
@@ -1178,14 +1224,14 @@ func tavilyHTTPClient(cfg *serverConfig) (*http.Client, error) {
 }
 
 type tavilySearchRequest struct {
-	Query            string   `json:"query"`
-	SearchDepth      string   `json:"search_depth,omitempty"`
-	Topic            string   `json:"topic,omitempty"`
-	MaxResults       int      `json:"max_results"`
-	IncludeAnswer    bool     `json:"include_answer"`
-	IncludeRawContent bool    `json:"include_raw_content"`
-	IncludeDomains   []string `json:"include_domains,omitempty"`
-	ExcludeDomains   []string `json:"exclude_domains,omitempty"`
+	Query             string   `json:"query"`
+	SearchDepth       string   `json:"search_depth,omitempty"`
+	Topic             string   `json:"topic,omitempty"`
+	MaxResults        int      `json:"max_results"`
+	IncludeAnswer     bool     `json:"include_answer"`
+	IncludeRawContent bool     `json:"include_raw_content"`
+	IncludeDomains    []string `json:"include_domains,omitempty"`
+	ExcludeDomains    []string `json:"exclude_domains,omitempty"`
 }
 
 type tavilySearchResponse struct {
@@ -1261,9 +1307,9 @@ func tavilyWebSearch(ctx context.Context, cfg *serverConfig, query string, allow
 
 		enc := base64.StdEncoding.EncodeToString([]byte(strings.TrimSpace(it.Content)))
 		contentItems = append(contentItems, map[string]any{
-			"type":             "web_search_result",
-			"url":              u,
-			"title":            strings.TrimSpace(it.Title),
+			"type":              "web_search_result",
+			"url":               u,
+			"title":             strings.TrimSpace(it.Title),
 			"encrypted_content": enc,
 		})
 
@@ -1322,47 +1368,28 @@ func tavilyWebFetch(ctx context.Context, cfg *serverConfig, targetURL string, se
 		return "", nil, err
 	}
 
-	client, err := tavilyHTTPClient(cfg)
+	var text string
+	var retrievedAt = time.Now().UTC().Format(time.RFC3339)
+
+	// --- 1. Try Tavily Extract ---
+	text, err = tryTavilyExtract(ctx, cfg, targetURL)
 	if err != nil {
-		return "", nil, err
-	}
-
-	reqBody := tavilyExtractRequest{
-		URLs:   []string{targetURL},
-		Format: "text",
-	}
-	b, _ := json.Marshal(reqBody)
-	endpoint := strings.TrimRight(cfg.tavilyBaseURL, "/") + "/extract"
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(b))
-	if err != nil {
-		return "", nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+cfg.tavilyAPIKey)
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", nil, err
-	}
-	defer resp.Body.Close()
-
-	raw, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", nil, fmt.Errorf("tavily extract status %d: %s", resp.StatusCode, takeFirstRunes(string(raw), 800))
-	}
-
-	var tr tavilyExtractResponse
-	if err := json.Unmarshal(raw, &tr); err != nil {
-		return "", nil, fmt.Errorf("tavily extract decode failed: %w", err)
-	}
-	if len(tr.Results) == 0 {
-		if len(tr.FailedResults) > 0 {
-			return "", nil, fmt.Errorf("tavily extract failed: %s", tr.FailedResults[0].Error)
+		// --- 2. Fallback: Direct Fetch (Direct -> Proxy) ---
+		text, err = directWebFetch(ctx, cfg, targetURL)
+		if err != nil {
+			return "", nil, fmt.Errorf("fetch failed (tavily error: %v, direct error: %v)", err, err)
 		}
-		return "", nil, errors.New("tavily extract returned no results")
 	}
 
-	text := tr.Results[0].RawContent
+	// --- 3. Optional: LLM Processing/Cleaning ---
+	if cfg.fetchLLMModelID != "" && text != "" && text != "(empty content)" {
+		processed, err := processFetchContentWithLLM(ctx, cfg, text)
+		if err == nil {
+			text = processed
+		} else {
+			log.Printf("fetch llm processing failed for %s: %v", targetURL, err)
+		}
+	}
 	if text == "" {
 		text = "(empty content)"
 	}
@@ -1385,7 +1412,7 @@ func tavilyWebFetch(ctx context.Context, cfg *serverConfig, targetURL string, se
 				"title":     "",
 				"citations": map[string]any{"enabled": false},
 			},
-			"retrieved_at": time.Now().UTC().Format(time.RFC3339),
+			"retrieved_at": retrievedAt,
 		},
 	}
 
@@ -1849,8 +1876,8 @@ type openaiChatCompletionResponse struct {
 	Model   string `json:"model"`
 	Choices []struct {
 		Message struct {
-			Role    string  `json:"role"`
-			Content *string `json:"content"`
+			Role      string  `json:"role"`
+			Content   *string `json:"content"`
 			ToolCalls []struct {
 				ID       string `json:"id"`
 				Type     string `json:"type"`
@@ -1863,8 +1890,8 @@ type openaiChatCompletionResponse struct {
 		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
 	Usage *struct {
-		PromptTokens     int `json:"prompt_tokens"`
-		CompletionTokens int `json:"completion_tokens"`
+		PromptTokens        int `json:"prompt_tokens"`
+		CompletionTokens    int `json:"completion_tokens"`
 		PromptTokensDetails *struct {
 			CachedTokens int `json:"cached_tokens"`
 		} `json:"prompt_tokens_details,omitempty"`
@@ -1966,11 +1993,11 @@ type openaiChatCompletionChunk struct {
 	Model   string `json:"model,omitempty"`
 	Choices []struct {
 		Delta struct {
-			Content *string `json:"content,omitempty"`
+			Content   *string `json:"content,omitempty"`
 			ToolCalls []struct {
-				Index int    `json:"index,omitempty"`
-				ID    string `json:"id,omitempty"`
-				Type  string `json:"type,omitempty"`
+				Index    int    `json:"index,omitempty"`
+				ID       string `json:"id,omitempty"`
+				Type     string `json:"type,omitempty"`
 				Function struct {
 					Name      string `json:"name,omitempty"`
 					Arguments string `json:"arguments,omitempty"`
@@ -2140,4 +2167,159 @@ func takeFirstRunes(s string, max int) string {
 		return s
 	}
 	return string(r[:max])
+}
+
+func tryTavilyExtract(ctx context.Context, cfg *serverConfig, targetURL string) (string, error) {
+	if cfg.tavilyAPIKey == "" {
+		return "", errors.New("tavily api key not configured")
+	}
+	client, err := tavilyHTTPClient(cfg)
+	if err != nil {
+		return "", err
+	}
+
+	reqBody := tavilyExtractRequest{
+		URLs:   []string{targetURL},
+		Format: "text",
+	}
+	b, _ := json.Marshal(reqBody)
+	endpoint := strings.TrimRight(cfg.tavilyBaseURL, "/") + "/extract"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(b))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+cfg.tavilyAPIKey)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("tavily extract status %d: %s", resp.StatusCode, takeFirstRunes(string(raw), 800))
+	}
+
+	var tr tavilyExtractResponse
+	if err := json.Unmarshal(raw, &tr); err != nil {
+		return "", fmt.Errorf("tavily extract decode failed: %w", err)
+	}
+	if len(tr.Results) == 0 {
+		if len(tr.FailedResults) > 0 {
+			return "", fmt.Errorf("tavily extract failed: %s", tr.FailedResults[0].Error)
+		}
+		return "", errors.New("tavily extract returned no results")
+	}
+
+	return tr.Results[0].RawContent, nil
+}
+
+func directWebFetch(ctx context.Context, cfg *serverConfig, targetURL string) (string, error) {
+	// Try direct first
+	content, err := fetchURLRaw(ctx, cfg, targetURL, false)
+	if err == nil {
+		return content, nil
+	}
+
+	// If failed and proxy is configured, try proxy
+	if cfg.tavilyProxyURL != "" {
+		return fetchURLRaw(ctx, cfg, targetURL, true)
+	}
+
+	return "", err
+}
+
+func fetchURLRaw(ctx context.Context, cfg *serverConfig, targetURL string, useProxy bool) (string, error) {
+	tr := &http.Transport{}
+	if useProxy {
+		pu, err := url.Parse(cfg.tavilyProxyURL)
+		if err != nil {
+			return "", err
+		}
+		tr.Proxy = http.ProxyURL(pu)
+	}
+	client := &http.Client{
+		Timeout: cfg.timeout,
+	}
+	if useProxy {
+		client.Transport = tr
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
+	if err != nil {
+		return "", err
+	}
+	// Browser-like User-Agent
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("http status %d", resp.StatusCode)
+	}
+
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+
+	return string(b), nil
+}
+
+func processFetchContentWithLLM(ctx context.Context, cfg *serverConfig, content string) (string, error) {
+	if cfg.fetchLLMModelID == "" {
+		return content, nil
+	}
+
+	mapping, ok := cfg.modelMap[cfg.fetchLLMModelID]
+	if !ok {
+		return content, fmt.Errorf("fetch_llm_model_id %q not found in providers", cfg.fetchLLMModelID)
+	}
+
+	provider := cfg.providers[mapping.ProviderIndex]
+	upstreamURL := provider.BaseURL
+	if !strings.HasSuffix(upstreamURL, "/chat/completions") {
+		if strings.HasSuffix(upstreamURL, "/") {
+			upstreamURL += "chat/completions"
+		} else {
+			upstreamURL += "/chat/completions"
+		}
+	}
+
+	openaiReq := openaiChatCompletionRequest{
+		Model: mapping.RemoteID,
+		Messages: []any{
+			map[string]any{"role": "system", "content": cfg.fetchLLMPrompt},
+			map[string]any{"role": "user", "content": content},
+		},
+		MaxTokens: 4096,
+	}
+
+	raw, _, err := doUpstreamJSON(ctx, cfg, openaiReq, upstreamURL, provider.APIKey)
+	if err != nil {
+		return "", fmt.Errorf("upstream llm failed: %w", err)
+	}
+
+	var resp openaiChatCompletionResponse
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return "", fmt.Errorf("llm response decode failed: %w (raw: %s)", err, takeFirstRunes(string(raw), 200))
+	}
+
+	if len(resp.Choices) == 0 {
+		return "", errors.New("llm returned no choices")
+	}
+
+	msgContent := resp.Choices[0].Message.Content
+	if msgContent == nil || *msgContent == "" {
+		return "", errors.New("llm returned empty content")
+	}
+
+	return *msgContent, nil
 }

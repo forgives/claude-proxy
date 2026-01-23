@@ -52,8 +52,11 @@ jobs:
           EXT=""
           if [ "${{ matrix.goos }}" = "windows" ]; then EXT=".exe"; fi
 
+          EXTRA_TAGS=""
+          if [ "${{ matrix.goos }}" = "linux" ]; then EXTRA_TAGS="-tags netgo"; fi
+
           CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
-            go build -trimpath -ldflags="-s -w" \
+            go build -trimpath ${EXTRA_TAGS} -ldflags="-s -w" \
             -o "dist/${BIN}-${{ matrix.goos }}-${{ matrix.goarch }}${EXT}" .
 
       - name: Upload build artifacts
