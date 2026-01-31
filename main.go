@@ -11,8 +11,13 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
+	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -32,10 +37,19 @@ type modelConfig struct {
 type fileConfig struct {
 	AK                        string           `json:"ak"`
 	Port                      int              `json:"port"`
+	Host                      string           `json:"host,omitempty"`
 	UpstreamTimeoutSeconds    int              `json:"upstream_timeout_seconds"`
 	LogBodyMaxChars           int              `json:"log_body_max_chars"`
 	LogStreamTextPreviewChars int              `json:"log_stream_text_preview_chars"`
 	Providers                 []providerConfig `json:"providers"`
+
+	// --- Tavily web tools ---
+	TavilyKey string `json:"tavily_key,omitempty"`
+	TavilyURL string `json:"tavily_url,omitempty"`
+
+	// --- Fetch LLM processing ---
+	FetchLLMModelID string `json:"fetch_llm_model_id,omitempty"`
+	FetchLLMPrompt  string `json:"fetch_llm_prompt,omitempty"`
 }
 
 type serverConfig struct {
@@ -46,6 +60,19 @@ type serverConfig struct {
 	logStreamPreviewMax int
 	providers           []providerConfig
 	modelMap            map[string]modelMapping
+
+	// --- Tavily web tools ---
+	tavilyAPIKey        string
+	tavilyBaseURL       string
+	tavilyProxyURL      string
+	tavilyMaxResults    int
+	tavilySearchDepth   string
+	tavilyTopic         string
+	tavilyFetchMaxRunes int
+
+	// --- Fetch LLM processing ---
+	fetchLLMModelID string
+	fetchLLMPrompt  string
 }
 
 type modelMapping struct {
@@ -92,13 +119,18 @@ func main() {
 	if cfg.serverAPIKey != "" {
 		log.Printf("inbound auth: enabled")
 	} else {
-		log.Printf("inbound auth: disabled (SERVER_API_KEY not set)")
+		log.Printf("inbound auth: disabled (AK missing / not set)")
+	}
+	if cfg.tavilyAPIKey != "" {
+		log.Printf("tavily web tools: enabled (base=%s proxy=%q)", cfg.tavilyBaseURL, cfg.tavilyProxyURL)
+	} else {
+		log.Printf("tavily web tools: disabled (no tavily_key / TAVILY_API_KEY)")
 	}
 	log.Fatal(srv.ListenAndServe())
 }
 
 func loadConfig() (*serverConfig, error) {
-	fc, err := loadFileConfig(strings.TrimSpace(envOr("CONFIG_PATH", "config.json")))
+	fc, err := loadFileConfig(findConfigPath())
 	if err != nil {
 		return nil, err
 	}
@@ -107,9 +139,10 @@ func loadConfig() (*serverConfig, error) {
 	if fc.Port > 0 {
 		port = fc.Port
 	}
-	addr := fmt.Sprintf(":%d", port)
+	host := strings.TrimSpace(envOr("HOST", fc.Host))
+	addr := fmt.Sprintf("%s:%d", host, port)
 
-	serverAPIKey := fc.AK
+	serverAPIKey := strings.TrimSpace(fc.AK)
 
 	timeout := 5 * time.Minute
 	if fc.UpstreamTimeoutSeconds > 0 {
@@ -132,24 +165,24 @@ func loadConfig() (*serverConfig, error) {
 
 	modelMap := make(map[string]modelMapping)
 	for i, p := range fc.Providers {
-		if p.BaseURL == "" {
+		if strings.TrimSpace(p.BaseURL) == "" {
 			return nil, fmt.Errorf("provider[%d]: missing base_url", i)
 		}
-		if p.APIKey == "" {
+		if strings.TrimSpace(p.APIKey) == "" {
 			return nil, fmt.Errorf("provider[%d]: missing api_key", i)
 		}
 		for j, m := range p.Models {
-			if m.ID == "" {
+			if strings.TrimSpace(m.ID) == "" {
 				return nil, fmt.Errorf("provider[%d].models[%d]: missing id", i, j)
 			}
 			if _, exists := modelMap[m.ID]; exists {
 				return nil, fmt.Errorf("duplicate model id: %q", m.ID)
 			}
-			remoteID := m.RemoteID
+			remoteID := strings.TrimSpace(m.RemoteID)
 			if remoteID == "" {
 				remoteID = m.ID
 			}
-			displayName := m.DisplayName
+			displayName := strings.TrimSpace(m.DisplayName)
 			if displayName == "" {
 				displayName = m.ID
 			}
@@ -161,6 +194,36 @@ func loadConfig() (*serverConfig, error) {
 		}
 	}
 
+	// --- Tavily config (env can override config file) ---
+	tavilyKey := strings.TrimSpace(envOr("TAVILY_API_KEY", fc.TavilyKey))
+	tavilyBase := strings.TrimSpace(envOr("TAVILY_BASE_URL", fc.TavilyURL))
+	if tavilyBase == "" {
+		tavilyBase = "https://api.tavily.com"
+	}
+	tavilyProxy := strings.TrimSpace(envOr("TAVILY_PROXY_ADDRESS", envOr("LOCAL_PROXY_ADDRESS", "")))
+
+	tavilyMaxResults := 5
+	if raw := strings.TrimSpace(envOr("TAVILY_MAX_RESULTS", "")); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 && n <= 20 {
+			tavilyMaxResults = n
+		}
+	}
+	tavilySearchDepth := strings.TrimSpace(envOr("TAVILY_SEARCH_DEPTH", "basic")) // basic|advanced
+	tavilyTopic := strings.TrimSpace(envOr("TAVILY_TOPIC", "general"))            // general|news|finance
+
+	tavilyFetchMaxRunes := 50000
+	if raw := strings.TrimSpace(envOr("TAVILY_FETCH_MAX_CHARS", "")); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n >= 1000 {
+			tavilyFetchMaxRunes = n
+		}
+	}
+
+	fetchLLMModelID := strings.TrimSpace(envOr("FETCH_LLM_MODEL_ID", fc.FetchLLMModelID))
+	fetchLLMPrompt := strings.TrimSpace(envOr("FETCH_LLM_PROMPT", fc.FetchLLMPrompt))
+	if fetchLLMPrompt == "" && fetchLLMModelID != "" {
+		fetchLLMPrompt = "Please summarize and clean the following web page content, removing junk, navigation, and ads, but keeping all important information and context. Return only the cleaned content."
+	}
+
 	return &serverConfig{
 		addr:                addr,
 		serverAPIKey:        serverAPIKey,
@@ -169,6 +232,17 @@ func loadConfig() (*serverConfig, error) {
 		logStreamPreviewMax: logStreamPreviewMax,
 		providers:           fc.Providers,
 		modelMap:            modelMap,
+
+		tavilyAPIKey:        tavilyKey,
+		tavilyBaseURL:       tavilyBase,
+		tavilyProxyURL:      tavilyProxy,
+		tavilyMaxResults:    tavilyMaxResults,
+		tavilySearchDepth:   tavilySearchDepth,
+		tavilyTopic:         tavilyTopic,
+		tavilyFetchMaxRunes: tavilyFetchMaxRunes,
+
+		fetchLLMModelID: fetchLLMModelID,
+		fetchLLMPrompt:  fetchLLMPrompt,
 	}, nil
 }
 
@@ -189,6 +263,32 @@ func envOr(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+func findConfigPath() string {
+	// 1. Env var
+	if p := strings.TrimSpace(os.Getenv("CONFIG_PATH")); p != "" {
+		return p
+	}
+
+	// 2. Exe dir
+	if exe, err := os.Executable(); err == nil {
+		p := filepath.Join(filepath.Dir(exe), "config.json")
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+
+	// 3. User config dir (normalized directory)
+	if confDir, err := os.UserConfigDir(); err == nil {
+		p := filepath.Join(confDir, "claude-proxy", "config.json")
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+
+	// 4. Fallback to current dir
+	return "config.json"
 }
 
 func handleModels(w http.ResponseWriter, r *http.Request, cfg *serverConfig) {
@@ -261,6 +361,39 @@ func handleMessages(w http.ResponseWriter, r *http.Request, cfg *serverConfig) {
 
 	logForwardedRequest(reqID, cfg, anthropicReq, openaiReq, upstreamURL)
 
+	// --- Tavily-backed web tools loop (web_search / web_fetch) ---
+	if requestWantsWebTools(anthropicReq.Tools) {
+		if cfg.tavilyAPIKey == "" {
+			log.Printf("[%s] web tools requested but Tavily key missing", reqID)
+			writeJSONError(w, http.StatusBadRequest, "missing_tavily_api_key")
+			return
+		}
+
+		allowedFetchURLs := extractAllowedFetchURLsFromAnthropicReq(&anthropicReq)
+
+		if anthropicReq.Stream {
+			loopReq := openaiReq
+			loopReq.Stream = false
+			if err := runWebToolsLoopAndStream(w, r, cfg, reqID, loopReq, upstreamURL, provider.APIKey, allowedFetchURLs); err != nil {
+				log.Printf("[%s] web-tools stream error: %v", reqID, err)
+			}
+			return
+		}
+
+		loopReq := openaiReq
+		loopReq.Stream = false
+		respMsg, err := runWebToolsLoop(r.Context(), cfg, reqID, loopReq, upstreamURL, provider.APIKey, allowedFetchURLs, anthropicReq.Tools)
+		if err != nil {
+			log.Printf("[%s] web-tools request failed: %v", reqID, err)
+			writeJSONError(w, http.StatusBadGateway, "upstream_request_failed")
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(respMsg)
+		return
+	}
+
+	// --- Regular proxy ---
 	if anthropicReq.Stream {
 		if streamErr := proxyStream(w, r, cfg, reqID, openaiReq, upstreamURL, provider.APIKey); streamErr != nil {
 			log.Printf("[%s] stream proxy error: %v", reqID, streamErr)
@@ -382,7 +515,7 @@ func proxyStream(w http.ResponseWriter, r *http.Request, cfg *serverConfig, reqI
 		return errors.New("http.Flusher not supported")
 	}
 
-	// Minimal OpenAI SSE -> Anthropic SSE conversion (text deltas).
+	// Minimal OpenAI SSE -> Anthropic SSE conversion (text + tool deltas).
 	encoder := func(event string, payload any) error {
 		b, err := json.Marshal(payload)
 		if err != nil {
@@ -521,14 +654,6 @@ func proxyStream(w http.ResponseWriter, r *http.Request, cfg *serverConfig, reqI
 					currentContentBlockIndex = idx
 					currentBlockType = "tool_use"
 				} else {
-					// Upgrade placeholder id/name if later deltas include them.
-					if state.id == "" && tcID != "" {
-						state.id = tcID
-					}
-					if state.name == "" && tcName != "" {
-						state.name = tcName
-					}
-					// Switch current block if needed.
 					currentContentBlockIndex = state.contentBlockIndex
 					currentBlockType = "tool_use"
 				}
@@ -553,7 +678,6 @@ func proxyStream(w http.ResponseWriter, r *http.Request, cfg *serverConfig, reqI
 			if cfg.logStreamPreviewMax > 0 && preview.Len() < cfg.logStreamPreviewMax {
 				preview.WriteString(takeFirstRunes(*delta.Content, cfg.logStreamPreviewMax-preview.Len()))
 			}
-			// If we were in a tool block, close it before starting/continuing text.
 			if currentBlockType != "" && currentBlockType != "text" {
 				closeCurrentBlock()
 			}
@@ -599,10 +723,8 @@ func proxyStream(w http.ResponseWriter, r *http.Request, cfg *serverConfig, reqI
 		}
 	}
 
-	// Close any open content block (text or tool_use).
 	closeCurrentBlock()
 
-	// Ensure message_delta is always emitted before message_stop.
 	if finishReason == "" {
 		_ = encoder("message_delta", map[string]any{
 			"type": "message_delta",
@@ -642,6 +764,723 @@ func writeJSONError(w http.ResponseWriter, status int, code string) {
 }
 
 // ----------------------
+// Tavily-backed Claude Code web tools
+// ----------------------
+
+type webToolSession struct {
+	allowedFetchURLs map[string]struct{}
+	maxUsesSearch    int
+	maxUsesFetch     int
+	usesSearch       int
+	usesFetch        int
+
+	searchAllowedDomains []string
+	searchBlockedDomains []string
+	fetchAllowedDomains  []string
+	fetchBlockedDomains  []string
+}
+
+func requestWantsWebTools(tools []anthropicTool) bool {
+	for _, t := range tools {
+		name := strings.ToLower(strings.TrimSpace(t.Name))
+		typ := strings.ToLower(strings.TrimSpace(t.Type))
+		if name == "web_search" || name == "web_fetch" {
+			return true
+		}
+		if strings.HasPrefix(typ, "web_search_") || strings.HasPrefix(typ, "web_fetch_") {
+			return true
+		}
+	}
+	return false
+}
+
+var urlRegex = regexp.MustCompile(`https?://[^\s<>"'\)\]]+`)
+
+func extractAllowedFetchURLsFromAnthropicReq(req *anthropicMessageRequest) map[string]struct{} {
+	allowed := map[string]struct{}{}
+
+	sys := extractSystemText(req.System)
+	for _, u := range urlRegex.FindAllString(sys, -1) {
+		allowed[u] = struct{}{}
+	}
+
+	for _, m := range req.Messages {
+		var asString string
+		if err := json.Unmarshal(m.Content, &asString); err == nil {
+			for _, u := range urlRegex.FindAllString(asString, -1) {
+				allowed[u] = struct{}{}
+			}
+			continue
+		}
+		var blocks []anthropicContentBlock
+		if err := json.Unmarshal(m.Content, &blocks); err != nil {
+			continue
+		}
+		for _, blk := range blocks {
+			if blk.Type == "text" && blk.Text != "" {
+				for _, u := range urlRegex.FindAllString(blk.Text, -1) {
+					allowed[u] = struct{}{}
+				}
+			}
+			if blk.Type == "image" && blk.Source != nil && blk.Source.Type == "url" && blk.Source.URL != "" {
+				allowed[blk.Source.URL] = struct{}{}
+			}
+			if blk.Type == "tool_result" && len(blk.Content) > 0 {
+				for _, u := range urlRegex.FindAllString(string(blk.Content), -1) {
+					allowed[u] = struct{}{}
+				}
+			}
+		}
+	}
+	return allowed
+}
+
+func applyWebToolPolicies(sess *webToolSession, tools []anthropicTool) {
+	sess.maxUsesSearch = 5
+	sess.maxUsesFetch = 10
+
+	for _, t := range tools {
+		name := strings.ToLower(strings.TrimSpace(t.Name))
+		typ := strings.ToLower(strings.TrimSpace(t.Type))
+		isSearch := name == "web_search" || strings.HasPrefix(typ, "web_search_")
+		isFetch := name == "web_fetch" || strings.HasPrefix(typ, "web_fetch_")
+		if !isSearch && !isFetch {
+			continue
+		}
+
+		if t.MaxUses > 0 {
+			if isSearch {
+				sess.maxUsesSearch = t.MaxUses
+			}
+			if isFetch {
+				sess.maxUsesFetch = t.MaxUses
+			}
+		}
+		if len(t.AllowedDomains) > 0 {
+			if isSearch {
+				sess.searchAllowedDomains = append([]string{}, t.AllowedDomains...)
+			}
+			if isFetch {
+				sess.fetchAllowedDomains = append([]string{}, t.AllowedDomains...)
+			}
+		}
+		if len(t.BlockedDomains) > 0 {
+			if isSearch {
+				sess.searchBlockedDomains = append([]string{}, t.BlockedDomains...)
+			}
+			if isFetch {
+				sess.fetchBlockedDomains = append([]string{}, t.BlockedDomains...)
+			}
+		}
+	}
+}
+
+func runWebToolsLoop(ctx context.Context, cfg *serverConfig, reqID string, openaiReq openaiChatCompletionRequest, upstreamURL, apiKey string, allowedFetchURLs map[string]struct{}, anthropicTools []anthropicTool) (anthropicMessageResponse, error) {
+	sess := &webToolSession{
+		allowedFetchURLs: allowedFetchURLs,
+	}
+	applyWebToolPolicies(sess, anthropicTools)
+
+	prefixBlocks := make([]any, 0, 16)
+
+	for step := 0; step < 12; step++ {
+		raw, resp, err := doUpstreamJSON(ctx, cfg, openaiReq, upstreamURL, apiKey)
+		if err != nil {
+			return anthropicMessageResponse{}, err
+		}
+		_ = resp.Body.Close()
+
+		var openaiResp openaiChatCompletionResponse
+		if err := json.Unmarshal(raw, &openaiResp); err != nil {
+			return anthropicMessageResponse{}, fmt.Errorf("invalid upstream json: %w", err)
+		}
+		if len(openaiResp.Choices) == 0 {
+			return anthropicMessageResponse{}, errors.New("upstream returned no choices")
+		}
+
+		ch := openaiResp.Choices[0]
+		if ch.Message.Content != nil && strings.TrimSpace(*ch.Message.Content) != "" {
+			prefixBlocks = append(prefixBlocks, map[string]any{
+				"type": "text",
+				"text": *ch.Message.Content,
+			})
+		}
+
+		// No tools => final answer
+		if len(ch.Message.ToolCalls) == 0 {
+			final := convertOpenAIToAnthropic(openaiResp)
+			if len(prefixBlocks) > 0 {
+				merged := make([]any, 0, len(prefixBlocks)+len(final.Content))
+				merged = append(merged, prefixBlocks...)
+				merged = append(merged, final.Content...)
+				final.Content = merged
+			}
+			return final, nil
+		}
+
+		// If non-web tool calls appear, pass through to client (don’t half-handle).
+		for _, tc := range ch.Message.ToolCalls {
+			n := strings.ToLower(strings.TrimSpace(tc.Function.Name))
+			if n != "web_search" && n != "web_fetch" {
+				out := convertOpenAIToAnthropic(openaiResp)
+				if len(prefixBlocks) > 0 {
+					merged := make([]any, 0, len(prefixBlocks)+len(out.Content))
+					merged = append(merged, prefixBlocks...)
+					merged = append(merged, out.Content...)
+					out.Content = merged
+				}
+				return out, nil
+			}
+		}
+
+		// Execute web tools and continue loop with tool results fed back to upstream.
+		for _, tc := range ch.Message.ToolCalls {
+			name := strings.ToLower(strings.TrimSpace(tc.Function.Name))
+			toolID := strings.TrimSpace(tc.ID)
+			if toolID == "" {
+				toolID = fmt.Sprintf("srvtoolu_%d", time.Now().UnixNano())
+			}
+
+			args := map[string]any{}
+			switch v := tc.Function.Arguments.(type) {
+			case string:
+				_ = json.Unmarshal([]byte(v), &args)
+			case map[string]any:
+				args = v
+			}
+
+			switch name {
+			case "web_search":
+				if sess.usesSearch >= sess.maxUsesSearch {
+					prefixBlocks = append(prefixBlocks,
+						map[string]any{
+							"type": "server_tool_use",
+							"id":   toolID,
+							"name": "web_search",
+							"input": map[string]any{
+								"query": fmt.Sprintf("%v", args["query"]),
+							},
+						},
+						map[string]any{
+							"type":        "web_search_tool_result",
+							"tool_use_id": toolID,
+							"content": map[string]any{
+								"type":          "web_search_tool_result_error",
+								"error_code":    "max_uses_exceeded",
+								"error_message": "web_search max_uses exceeded",
+								"retryable":     false,
+								"details":       "",
+							},
+						},
+					)
+					openaiReq.Messages = append(openaiReq.Messages,
+						openaiAssistantToolCallMessage(toolID, "web_search", mustJSON(args)),
+						map[string]any{"role": "tool", "tool_call_id": toolID, "content": `{"error":"max_uses_exceeded"}`},
+					)
+					continue
+				}
+				sess.usesSearch++
+
+				q := strings.TrimSpace(fmt.Sprintf("%v", args["query"]))
+				if q == "" {
+					q = strings.TrimSpace(fmt.Sprintf("%v", args["q"]))
+				}
+
+				prefixBlocks = append(prefixBlocks, map[string]any{
+					"type": "server_tool_use",
+					"id":   toolID,
+					"name": "web_search",
+					"input": map[string]any{
+						"query": q,
+					},
+				})
+
+				modelToolContent, clientResultBlock, discoveredURLs, err := tavilyWebSearch(ctx, cfg, q, sess.searchAllowedDomains, sess.searchBlockedDomains)
+				if err != nil {
+					prefixBlocks = append(prefixBlocks, map[string]any{
+						"type":        "web_search_tool_result",
+						"tool_use_id": toolID,
+						"content": map[string]any{
+							"type":          "web_search_tool_result_error",
+							"error_code":    "search_failed",
+							"error_message": err.Error(),
+						},
+					})
+					openaiReq.Messages = append(openaiReq.Messages,
+						openaiAssistantToolCallMessage(toolID, "web_search", mustJSON(args)),
+						map[string]any{"role": "tool", "tool_call_id": toolID, "content": fmt.Sprintf(`{"error":%q}`, err.Error())},
+					)
+					continue
+				}
+
+				for u := range discoveredURLs {
+					sess.allowedFetchURLs[u] = struct{}{}
+				}
+
+				// attach tool_use_id
+				if m, ok := clientResultBlock.(map[string]any); ok {
+					m["tool_use_id"] = toolID
+				}
+				prefixBlocks = append(prefixBlocks, clientResultBlock)
+
+				openaiReq.Messages = append(openaiReq.Messages,
+					openaiAssistantToolCallMessage(toolID, "web_search", mustJSON(args)),
+					map[string]any{"role": "tool", "tool_call_id": toolID, "content": modelToolContent},
+				)
+
+			case "web_fetch":
+				if sess.usesFetch >= sess.maxUsesFetch {
+					prefixBlocks = append(prefixBlocks,
+						map[string]any{
+							"type": "server_tool_use",
+							"id":   toolID,
+							"name": "web_fetch",
+							"input": map[string]any{
+								"url": fmt.Sprintf("%v", args["url"]),
+							},
+						},
+						map[string]any{
+							"type":        "web_fetch_tool_result",
+							"tool_use_id": toolID,
+							"content": map[string]any{
+								"type":          "web_fetch_tool_result_error",
+								"error_code":    "max_uses_exceeded",
+								"error_message": "web_fetch max_uses exceeded",
+							},
+						},
+					)
+					openaiReq.Messages = append(openaiReq.Messages,
+						openaiAssistantToolCallMessage(toolID, "web_fetch", mustJSON(args)),
+						map[string]any{"role": "tool", "tool_call_id": toolID, "content": `{"error":"max_uses_exceeded"}`},
+					)
+					continue
+				}
+				sess.usesFetch++
+
+				targetURL := strings.TrimSpace(fmt.Sprintf("%v", args["url"]))
+				prefixBlocks = append(prefixBlocks, map[string]any{
+					"type": "server_tool_use",
+					"id":   toolID,
+					"name": "web_fetch",
+					"input": map[string]any{
+						"url": targetURL,
+					},
+				})
+
+				modelToolContent, clientResultBlock, err := tavilyWebFetch(ctx, cfg, targetURL, sess)
+				if err != nil {
+					prefixBlocks = append(prefixBlocks, map[string]any{
+						"type":        "web_fetch_tool_result",
+						"tool_use_id": toolID,
+						"content": map[string]any{
+							"type":          "web_fetch_tool_result_error",
+							"error_code":    "fetch_failed",
+							"error_message": err.Error(),
+						},
+					})
+					openaiReq.Messages = append(openaiReq.Messages,
+						openaiAssistantToolCallMessage(toolID, "web_fetch", mustJSON(args)),
+						map[string]any{"role": "tool", "tool_call_id": toolID, "content": fmt.Sprintf(`{"error":%q}`, err.Error())},
+					)
+					continue
+				}
+
+				if m, ok := clientResultBlock.(map[string]any); ok {
+					m["tool_use_id"] = toolID
+				}
+				prefixBlocks = append(prefixBlocks, clientResultBlock)
+
+				openaiReq.Messages = append(openaiReq.Messages,
+					openaiAssistantToolCallMessage(toolID, "web_fetch", mustJSON(args)),
+					map[string]any{"role": "tool", "tool_call_id": toolID, "content": modelToolContent},
+				)
+			}
+		}
+	}
+
+	return anthropicMessageResponse{}, errors.New("web-tools loop exceeded max steps")
+}
+
+func runWebToolsLoopAndStream(w http.ResponseWriter, r *http.Request, cfg *serverConfig, reqID string, openaiReq openaiChatCompletionRequest, upstreamURL, apiKey string, allowedFetchURLs map[string]struct{}) error {
+	// Not truly incremental streaming. We do the tool loop, then emit one Anthropic SSE message.
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeJSONError(w, http.StatusInternalServerError, "streaming_not_supported")
+		return errors.New("http.Flusher not supported")
+	}
+
+	encoder := func(event string, payload any) error {
+		b, err := json.Marshal(payload)
+		if err != nil {
+			return err
+		}
+		if _, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, string(b)); err != nil {
+			return err
+		}
+		flusher.Flush()
+		return nil
+	}
+
+	// We do not have the original anthropic tools here; just run with defaults.
+	respMsg, err := runWebToolsLoop(r.Context(), cfg, reqID, openaiReq, upstreamURL, apiKey, allowedFetchURLs, nil)
+	if err != nil {
+		_ = encoder("error", map[string]any{"type": "error", "message": err.Error()})
+		return err
+	}
+
+	messageID := respMsg.ID
+	if strings.TrimSpace(messageID) == "" {
+		messageID = fmt.Sprintf("msg_%d", time.Now().UnixMilli())
+	}
+
+	_ = encoder("message_start", map[string]any{
+		"type": "message_start",
+		"message": map[string]any{
+			"id":            messageID,
+			"type":          "message",
+			"role":          "assistant",
+			"model":         respMsg.Model,
+			"content":       []any{},
+			"stop_reason":   nil,
+			"stop_sequence": nil,
+			"usage":         map[string]any{"input_tokens": 0, "output_tokens": 0},
+		},
+	})
+
+	idx := 0
+	for _, blk := range respMsg.Content {
+		// safest: stream as JSON text chunks (Claude Code UI still sees it)
+		_ = encoder("content_block_start", map[string]any{
+			"type":  "content_block_start",
+			"index": idx,
+			"content_block": map[string]any{
+				"type": "text",
+				"text": "",
+			},
+		})
+		j, _ := json.Marshal(blk)
+		_ = encoder("content_block_delta", map[string]any{
+			"type":  "content_block_delta",
+			"index": idx,
+			"delta": map[string]any{
+				"type": "text_delta",
+				"text": string(j) + "\n",
+			},
+		})
+		_ = encoder("content_block_stop", map[string]any{"type": "content_block_stop", "index": idx})
+		idx++
+	}
+
+	_ = encoder("message_delta", map[string]any{
+		"type": "message_delta",
+		"delta": map[string]any{
+			"stop_reason":   respMsg.StopReason,
+			"stop_sequence": nil,
+		},
+		"usage": map[string]any{"input_tokens": 0, "output_tokens": 0, "cache_read_input_tokens": 0},
+	})
+	_ = encoder("message_stop", map[string]any{"type": "message_stop"})
+	return nil
+}
+
+func openaiAssistantToolCallMessage(toolID, name, argsJSON string) map[string]any {
+	return map[string]any{
+		"role":    "assistant",
+		"content": nil,
+		"tool_calls": []any{
+			map[string]any{
+				"id":   toolID,
+				"type": "function",
+				"function": map[string]any{
+					"name":      name,
+					"arguments": argsJSON,
+				},
+			},
+		},
+	}
+}
+
+func tavilyHTTPClient(cfg *serverConfig) (*http.Client, error) {
+	tr := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+	}
+	if strings.TrimSpace(cfg.tavilyProxyURL) != "" {
+		pu, err := url.Parse(cfg.tavilyProxyURL)
+		if err != nil {
+			return nil, fmt.Errorf("invalid tavily proxy url: %w", err)
+		}
+		tr.Proxy = http.ProxyURL(pu)
+	}
+	return &http.Client{
+		Timeout:   cfg.timeout,
+		Transport: tr,
+	}, nil
+}
+
+type tavilySearchRequest struct {
+	Query             string   `json:"query"`
+	SearchDepth       string   `json:"search_depth,omitempty"`
+	Topic             string   `json:"topic,omitempty"`
+	MaxResults        int      `json:"max_results"`
+	IncludeAnswer     bool     `json:"include_answer"`
+	IncludeRawContent bool     `json:"include_raw_content"`
+	IncludeDomains    []string `json:"include_domains,omitempty"`
+	ExcludeDomains    []string `json:"exclude_domains,omitempty"`
+}
+
+type tavilySearchResponse struct {
+	Query   string `json:"query"`
+	Results []struct {
+		Title   string  `json:"title"`
+		URL     string  `json:"url"`
+		Content string  `json:"content"`
+		Score   float64 `json:"score"`
+	} `json:"results"`
+	RequestID string `json:"request_id"`
+}
+
+func tavilyWebSearch(ctx context.Context, cfg *serverConfig, query string, allowedDomains, blockedDomains []string) (modelToolContent string, clientResultBlock any, discoveredURLs map[string]struct{}, err error) {
+	client, err := tavilyHTTPClient(cfg)
+	if err != nil {
+		return "", nil, nil, err
+	}
+
+	reqBody := tavilySearchRequest{
+		Query:             query,
+		SearchDepth:       cfg.tavilySearchDepth,
+		Topic:             cfg.tavilyTopic,
+		MaxResults:        cfg.tavilyMaxResults,
+		IncludeAnswer:     false,
+		IncludeRawContent: false,
+	}
+	if len(allowedDomains) > 0 {
+		reqBody.IncludeDomains = allowedDomains
+	}
+	if len(blockedDomains) > 0 {
+		reqBody.ExcludeDomains = blockedDomains
+	}
+
+	b, _ := json.Marshal(reqBody)
+	endpoint := strings.TrimRight(cfg.tavilyBaseURL, "/") + "/search"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(b))
+	if err != nil {
+		return "", nil, nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+cfg.tavilyAPIKey)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", nil, nil, err
+	}
+	defer resp.Body.Close()
+
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", nil, nil, fmt.Errorf("tavily search status %d: %s", resp.StatusCode, takeFirstRunes(string(raw), 800))
+	}
+
+	var tr tavilySearchResponse
+	if err := json.Unmarshal(raw, &tr); err != nil {
+		return "", nil, nil, fmt.Errorf("tavily search decode failed: %w", err)
+	}
+
+	discoveredURLs = map[string]struct{}{}
+	contentItems := make([]any, 0, len(tr.Results))
+
+	var sb strings.Builder
+	sb.WriteString(`{"type":"web_search","query":`)
+	sb.WriteString(strconv.Quote(query))
+	sb.WriteString(`,"results":[`)
+
+	for i, it := range tr.Results {
+		u := strings.TrimSpace(it.URL)
+		if u != "" {
+			discoveredURLs[u] = struct{}{}
+		}
+
+		enc := base64.StdEncoding.EncodeToString([]byte(strings.TrimSpace(it.Content)))
+		contentItems = append(contentItems, map[string]any{
+			"type":              "web_search_result",
+			"url":               u,
+			"title":             strings.TrimSpace(it.Title),
+			"encrypted_content": enc,
+		})
+
+		if i > 0 {
+			sb.WriteString(",")
+		}
+		sb.WriteString(`{"title":`)
+		sb.WriteString(strconv.Quote(strings.TrimSpace(it.Title)))
+		sb.WriteString(`,"url":`)
+		sb.WriteString(strconv.Quote(u))
+		sb.WriteString(`,"snippet":`)
+		sb.WriteString(strconv.Quote(takeFirstRunes(strings.TrimSpace(it.Content), 1200)))
+		sb.WriteString("}")
+	}
+	sb.WriteString("]}")
+
+	clientResultBlock = map[string]any{
+		"type":    "web_search_tool_result",
+		"content": contentItems,
+	}
+	return sb.String(), clientResultBlock, discoveredURLs, nil
+}
+
+type tavilyExtractRequest struct {
+	URLs   any    `json:"urls"` // string or []string
+	Format string `json:"format,omitempty"`
+}
+
+type tavilyExtractResponse struct {
+	Results []struct {
+		URL        string `json:"url"`
+		RawContent string `json:"raw_content"`
+	} `json:"results"`
+	FailedResults []struct {
+		URL   string `json:"url"`
+		Error string `json:"error"`
+	} `json:"failed_results"`
+	RequestID string `json:"request_id"`
+}
+
+func tavilyWebFetch(ctx context.Context, cfg *serverConfig, targetURL string, sess *webToolSession) (modelToolContent string, clientResultBlock any, err error) {
+	targetURL = strings.TrimSpace(targetURL)
+	if targetURL == "" {
+		return "", nil, errors.New("missing url")
+	}
+
+	// Require URL to appear in conversation/search results first.
+	if _, ok := sess.allowedFetchURLs[targetURL]; !ok {
+		return "", nil, fmt.Errorf("web_fetch url not allowed (must appear in conversation/search results): %s", targetURL)
+	}
+
+	if err := validateFetchURL(targetURL); err != nil {
+		return "", nil, err
+	}
+	if err := enforceDomainFilters(targetURL, sess.fetchAllowedDomains, sess.fetchBlockedDomains); err != nil {
+		return "", nil, err
+	}
+
+	var text string
+	var retrievedAt = time.Now().UTC().Format(time.RFC3339)
+
+	// --- 1. Try Tavily Extract ---
+	text, err = tryTavilyExtract(ctx, cfg, targetURL)
+	if err != nil {
+		// --- 2. Fallback: Direct Fetch (Direct -> Proxy) ---
+		text, err = directWebFetch(ctx, cfg, targetURL)
+		if err != nil {
+			return "", nil, fmt.Errorf("fetch failed (tavily error: %v, direct error: %v)", err, err)
+		}
+	}
+
+	// --- 3. Optional: LLM Processing/Cleaning ---
+	if cfg.fetchLLMModelID != "" && text != "" && text != "(empty content)" {
+		processed, err := processFetchContentWithLLM(ctx, cfg, text)
+		if err == nil {
+			text = processed
+		} else {
+			log.Printf("fetch llm processing failed for %s: %v", targetURL, err)
+		}
+	}
+	if text == "" {
+		text = "(empty content)"
+	}
+	text = takeFirstRunes(text, cfg.tavilyFetchMaxRunes)
+
+	modelToolContent = fmt.Sprintf(`{"type":"web_fetch","url":%q,"content":%q}`, targetURL, text)
+
+	clientResultBlock = map[string]any{
+		"type": "web_fetch_tool_result",
+		"content": map[string]any{
+			"type": "web_fetch_result",
+			"url":  targetURL,
+			"content": map[string]any{
+				"type": "document",
+				"source": map[string]any{
+					"type":       "text",
+					"media_type": "text/plain",
+					"data":       text,
+				},
+				"title":     "",
+				"citations": map[string]any{"enabled": false},
+			},
+			"retrieved_at": retrievedAt,
+		},
+	}
+
+	return modelToolContent, clientResultBlock, nil
+}
+
+func validateFetchURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("invalid url: %w", err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("unsupported url scheme: %q", u.Scheme)
+	}
+	host := u.Hostname()
+	if host == "" {
+		return errors.New("missing url host")
+	}
+	lh := strings.ToLower(host)
+	if lh == "localhost" || strings.HasSuffix(lh, ".local") {
+		return fmt.Errorf("blocked host: %s", host)
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+			return fmt.Errorf("blocked ip host: %s", host)
+		}
+	}
+	return nil
+}
+
+func enforceDomainFilters(raw string, allowed, blocked []string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("invalid url: %w", err)
+	}
+	host := strings.ToLower(u.Hostname())
+
+	if len(blocked) > 0 {
+		for _, d := range blocked {
+			d = strings.ToLower(strings.TrimSpace(d))
+			if d == "" {
+				continue
+			}
+			if host == d || strings.HasSuffix(host, "."+d) {
+				return fmt.Errorf("blocked domain by policy: %s", host)
+			}
+		}
+	}
+	if len(allowed) > 0 {
+		ok := false
+		for _, d := range allowed {
+			d = strings.ToLower(strings.TrimSpace(d))
+			if d == "" {
+				continue
+			}
+			if host == d || strings.HasSuffix(host, "."+d) {
+				ok = true
+				break
+			}
+		}
+		if !ok {
+			return fmt.Errorf("domain not in allowlist: %s", host)
+		}
+	}
+	return nil
+}
+
+// ----------------------
 // Anthropic request types
 // ----------------------
 
@@ -663,9 +1502,17 @@ type anthropicMsg struct {
 }
 
 type anthropicTool struct {
+	// Claude Code server tools often include "type":"web_search_YYYYMMDD" etc.
+	Type string `json:"type,omitempty"`
+
 	Name        string          `json:"name"`
 	Description string          `json:"description,omitempty"`
 	InputSchema json.RawMessage `json:"input_schema,omitempty"`
+
+	// Optional policy knobs (Claude Code)
+	MaxUses        int      `json:"max_uses,omitempty"`
+	AllowedDomains []string `json:"allowed_domains,omitempty"`
+	BlockedDomains []string `json:"blocked_domains,omitempty"`
 }
 
 type anthropicContentBlock struct {
@@ -708,6 +1555,22 @@ type openaiChatCompletionRequest struct {
 	ToolChoice  any    `json:"tool_choice,omitempty"`
 }
 
+const defaultWebSearchSchemaJSON = `{
+  "type": "object",
+  "properties": {
+    "query": { "type": "string", "description": "Search query string." }
+  },
+  "required": ["query"]
+}`
+
+const defaultWebFetchSchemaJSON = `{
+  "type": "object",
+  "properties": {
+    "url": { "type": "string", "description": "URL to fetch (must already appear in the conversation or search results)." }
+  },
+  "required": ["url"]
+}`
+
 func convertAnthropicToOpenAI(req *anthropicMessageRequest) (openaiChatCompletionRequest, error) {
 	var messages []any
 
@@ -724,7 +1587,6 @@ func convertAnthropicToOpenAI(req *anthropicMessageRequest) (openaiChatCompletio
 			continue
 		}
 
-		// content can be string or array of blocks
 		var asString string
 		if err := json.Unmarshal(m.Content, &asString); err == nil {
 			messages = append(messages, map[string]any{
@@ -753,7 +1615,6 @@ func convertAnthropicToOpenAI(req *anthropicMessageRequest) (openaiChatCompletio
 			}
 			messages = append(messages, assistantMsg)
 		default:
-			// pass through unknown roles as string if possible
 			text := joinTextBlocks(blocks)
 			messages = append(messages, map[string]any{
 				"role":    role,
@@ -773,6 +1634,32 @@ func convertAnthropicToOpenAI(req *anthropicMessageRequest) (openaiChatCompletio
 	if len(req.Tools) > 0 {
 		out.Tools = make([]any, 0, len(req.Tools))
 		for _, t := range req.Tools {
+			if isAnthropicWebTool(t) {
+				var schema any
+				if isWebFetchTool(t) {
+					_ = json.Unmarshal([]byte(defaultWebFetchSchemaJSON), &schema)
+					out.Tools = append(out.Tools, map[string]any{
+						"type": "function",
+						"function": map[string]any{
+							"name":        "web_fetch",
+							"description": "Fetch content from a URL (proxy-backed).",
+							"parameters":  schema,
+						},
+					})
+				} else {
+					_ = json.Unmarshal([]byte(defaultWebSearchSchemaJSON), &schema)
+					out.Tools = append(out.Tools, map[string]any{
+						"type": "function",
+						"function": map[string]any{
+							"name":        "web_search",
+							"description": "Search the web (proxy-backed).",
+							"parameters":  schema,
+						},
+					})
+				}
+				continue
+			}
+
 			var params any
 			if len(t.InputSchema) > 0 {
 				_ = json.Unmarshal(t.InputSchema, &params)
@@ -793,6 +1680,24 @@ func convertAnthropicToOpenAI(req *anthropicMessageRequest) (openaiChatCompletio
 	}
 
 	return out, nil
+}
+
+func isAnthropicWebTool(t anthropicTool) bool {
+	name := strings.ToLower(strings.TrimSpace(t.Name))
+	typ := strings.ToLower(strings.TrimSpace(t.Type))
+	if name == "web_search" || name == "web_fetch" {
+		return true
+	}
+	if strings.HasPrefix(typ, "web_search_") || strings.HasPrefix(typ, "web_fetch_") {
+		return true
+	}
+	return false
+}
+
+func isWebFetchTool(t anthropicTool) bool {
+	name := strings.ToLower(strings.TrimSpace(t.Name))
+	typ := strings.ToLower(strings.TrimSpace(t.Type))
+	return name == "web_fetch" || strings.HasPrefix(typ, "web_fetch_")
 }
 
 func extractSystemText(raw json.RawMessage) string {
@@ -826,7 +1731,6 @@ func joinTextBlocks(blocks []anthropicContentBlock) string {
 func convertAnthropicUserBlocksToOpenAIMessages(blocks []anthropicContentBlock) ([]any, error) {
 	var out []any
 
-	// tool_result blocks become separate OpenAI "tool" messages.
 	for _, blk := range blocks {
 		if blk.Type != "tool_result" || strings.TrimSpace(blk.ToolUseID) == "" {
 			continue
@@ -847,7 +1751,6 @@ func convertAnthropicUserBlocksToOpenAIMessages(blocks []anthropicContentBlock) 
 		})
 	}
 
-	// remaining text/image blocks become a user message
 	var parts []any
 	for _, blk := range blocks {
 		switch blk.Type {
@@ -859,27 +1762,26 @@ func convertAnthropicUserBlocksToOpenAIMessages(blocks []anthropicContentBlock) 
 			if blk.Source == nil {
 				continue
 			}
-			url := ""
+			u := ""
 			switch blk.Source.Type {
 			case "base64":
 				if blk.Source.MediaType == "" || blk.Source.Data == "" {
 					continue
 				}
-				// Validate base64 to avoid obviously invalid payloads.
 				if _, err := base64.StdEncoding.DecodeString(blk.Source.Data); err != nil {
 					continue
 				}
-				url = "data:" + blk.Source.MediaType + ";base64," + blk.Source.Data
+				u = "data:" + blk.Source.MediaType + ";base64," + blk.Source.Data
 			case "url":
-				url = blk.Source.URL
+				u = blk.Source.URL
 			default:
 				continue
 			}
-			if url != "" {
+			if u != "" {
 				parts = append(parts, map[string]any{
 					"type": "image_url",
 					"image_url": map[string]any{
-						"url": url,
+						"url": u,
 					},
 				})
 			}
@@ -928,9 +1830,7 @@ func convertAnthropicAssistantBlocksToOpenAIMessage(blocks []anthropicContentBlo
 		})
 	}
 
-	msg := map[string]any{
-		"role": "assistant",
-	}
+	msg := map[string]any{"role": "assistant"}
 	if text != "" {
 		msg["content"] = text
 	} else {
@@ -943,10 +1843,6 @@ func convertAnthropicAssistantBlocksToOpenAIMessage(blocks []anthropicContentBlo
 }
 
 func convertToolChoice(v any) any {
-	// Anthropic forms:
-	// - {"type":"auto"}
-	// - {"type":"tool","name":"my_tool"}
-	// - string values (rare)
 	m, ok := v.(map[string]any)
 	if !ok {
 		return v
@@ -1142,14 +2038,22 @@ func logForwardedUpstreamBody(reqID string, cfg *serverConfig, body []byte) {
 	log.Printf("[%s] upstream body=%s", reqID, s)
 }
 
+func mustJSON(v any) string {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return `{"_error":"json_marshal_failed"}`
+	}
+	return string(b)
+}
+
 func mustJSONTrunc(v any, maxChars int) string {
 	b, err := json.Marshal(v)
 	if err != nil {
 		return fmt.Sprintf(`{"_error":"json_marshal_failed","detail":%q}`, err.Error())
 	}
 	s := string(b)
-	if maxChars == 0 {
-		return "(disabled)"
+	if maxChars <= 0 {
+		return s
 	}
 	if len([]rune(s)) > maxChars {
 		return string([]rune(s)[:maxChars]) + "...(truncated)"
@@ -1182,7 +2086,6 @@ func sanitizeOpenAIMessages(msgs []any) []any {
 		if content, ok := cp["content"]; ok {
 			cp["content"] = sanitizeMessageContent(content)
 		}
-		// tool_calls may carry huge arguments; keep but truncate strings.
 		if tc, ok := cp["tool_calls"]; ok {
 			cp["tool_calls"] = sanitizeAny(tc)
 		}
@@ -1209,7 +2112,7 @@ func sanitizeMessageContent(content any) any {
 			}
 			if cp["type"] == "image_url" {
 				if iu, ok := cp["image_url"].(map[string]any); ok {
-					if url, ok := iu["url"].(string); ok && strings.HasPrefix(url, "data:") {
+					if u, ok := iu["url"].(string); ok && strings.HasPrefix(u, "data:") {
 						iu2 := map[string]any{}
 						for k, vv := range iu {
 							iu2[k] = vv
@@ -1249,7 +2152,6 @@ func sanitizeAny(v any) any {
 	case []any:
 		return sanitizeAnySlice(t)
 	case string:
-		// keep strings; truncation is handled at final JSON layer
 		return t
 	default:
 		return v
@@ -1265,4 +2167,159 @@ func takeFirstRunes(s string, max int) string {
 		return s
 	}
 	return string(r[:max])
+}
+
+func tryTavilyExtract(ctx context.Context, cfg *serverConfig, targetURL string) (string, error) {
+	if cfg.tavilyAPIKey == "" {
+		return "", errors.New("tavily api key not configured")
+	}
+	client, err := tavilyHTTPClient(cfg)
+	if err != nil {
+		return "", err
+	}
+
+	reqBody := tavilyExtractRequest{
+		URLs:   []string{targetURL},
+		Format: "text",
+	}
+	b, _ := json.Marshal(reqBody)
+	endpoint := strings.TrimRight(cfg.tavilyBaseURL, "/") + "/extract"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(b))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+cfg.tavilyAPIKey)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("tavily extract status %d: %s", resp.StatusCode, takeFirstRunes(string(raw), 800))
+	}
+
+	var tr tavilyExtractResponse
+	if err := json.Unmarshal(raw, &tr); err != nil {
+		return "", fmt.Errorf("tavily extract decode failed: %w", err)
+	}
+	if len(tr.Results) == 0 {
+		if len(tr.FailedResults) > 0 {
+			return "", fmt.Errorf("tavily extract failed: %s", tr.FailedResults[0].Error)
+		}
+		return "", errors.New("tavily extract returned no results")
+	}
+
+	return tr.Results[0].RawContent, nil
+}
+
+func directWebFetch(ctx context.Context, cfg *serverConfig, targetURL string) (string, error) {
+	// Try direct first
+	content, err := fetchURLRaw(ctx, cfg, targetURL, false)
+	if err == nil {
+		return content, nil
+	}
+
+	// If failed and proxy is configured, try proxy
+	if cfg.tavilyProxyURL != "" {
+		return fetchURLRaw(ctx, cfg, targetURL, true)
+	}
+
+	return "", err
+}
+
+func fetchURLRaw(ctx context.Context, cfg *serverConfig, targetURL string, useProxy bool) (string, error) {
+	tr := &http.Transport{}
+	if useProxy {
+		pu, err := url.Parse(cfg.tavilyProxyURL)
+		if err != nil {
+			return "", err
+		}
+		tr.Proxy = http.ProxyURL(pu)
+	}
+	client := &http.Client{
+		Timeout: cfg.timeout,
+	}
+	if useProxy {
+		client.Transport = tr
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
+	if err != nil {
+		return "", err
+	}
+	// Browser-like User-Agent
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("http status %d", resp.StatusCode)
+	}
+
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+
+	return string(b), nil
+}
+
+func processFetchContentWithLLM(ctx context.Context, cfg *serverConfig, content string) (string, error) {
+	if cfg.fetchLLMModelID == "" {
+		return content, nil
+	}
+
+	mapping, ok := cfg.modelMap[cfg.fetchLLMModelID]
+	if !ok {
+		return content, fmt.Errorf("fetch_llm_model_id %q not found in providers", cfg.fetchLLMModelID)
+	}
+
+	provider := cfg.providers[mapping.ProviderIndex]
+	upstreamURL := provider.BaseURL
+	if !strings.HasSuffix(upstreamURL, "/chat/completions") {
+		if strings.HasSuffix(upstreamURL, "/") {
+			upstreamURL += "chat/completions"
+		} else {
+			upstreamURL += "/chat/completions"
+		}
+	}
+
+	openaiReq := openaiChatCompletionRequest{
+		Model: mapping.RemoteID,
+		Messages: []any{
+			map[string]any{"role": "system", "content": cfg.fetchLLMPrompt},
+			map[string]any{"role": "user", "content": content},
+		},
+		MaxTokens: 4096,
+	}
+
+	raw, _, err := doUpstreamJSON(ctx, cfg, openaiReq, upstreamURL, provider.APIKey)
+	if err != nil {
+		return "", fmt.Errorf("upstream llm failed: %w", err)
+	}
+
+	var resp openaiChatCompletionResponse
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return "", fmt.Errorf("llm response decode failed: %w (raw: %s)", err, takeFirstRunes(string(raw), 200))
+	}
+
+	if len(resp.Choices) == 0 {
+		return "", errors.New("llm returned no choices")
+	}
+
+	msgContent := resp.Choices[0].Message.Content
+	if msgContent == nil || *msgContent == "" {
+		return "", errors.New("llm returned empty content")
+	}
+
+	return *msgContent, nil
 }
